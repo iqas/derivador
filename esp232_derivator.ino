@@ -17,52 +17,43 @@
 #include <PubSubClient.h>// to use MQTT protocol
 #include "EEPROM.h"
 
-#define OLED false
+
+#define OLED true
 // !!!!Turn to true when oled screen is available!!!! --> WIFI KIT 32
 
 #if OLED
-#include <SSD1306.h>                                                              
+#include <SSD1306Wire.h>                                                              
 #endif
 
 #if OLED 
-SSD1306 display(0x3c, 4, 15); //For OLED
+SSD1306Wire display(0x3c, 4, 15); //For OLED
 #endif
 
 #define true 0x1
 #define false 0x0
 #define USE_SERIAL Serial
 
-// Update these with values suitable for your network.
-
-//const char* ssid = "";
-//const char* password = "";
-//const char* ssid2 = "";
-//const char* password2 = "";
-//Cambiar parametros temporalmente en la función de setup
-const char* solax_api = "http://192.168.90.105/api/realTimeData.htm"; //Api for Wifi solax V1, change only the IP
-
-//-------- mqtt setup --------//
-const char solax_mqtt_active = true; // turn false to deactivate mqtt
-const char * MQTT_broker = "192.168.90.15";//name of the mqtt broker
-const char * MQTT_user = "moscon";//username to access to the broker
-const char * MQTT_password = "pepon";//password to access to the broker
-const uint16_t MQTT_port = 1883; // port  to access to the broker
-
 // Set up the pwm output
 #if OLED
 uint8_t pin_pwm = 25;
+uint8_t pin_rx = 17;
+uint8_t pin_tx = 5;
 #else
 uint8_t pin_pwm = 2;
+uint8_t pin_rx = 17;
+uint8_t pin_tx = 5;
+
 #endif
 uint16_t solax_pwm = 0;          // a value from 0 to 65535 representing the pwm value
-uint16_t solax_increment  = 6000;  // Value for increment or decrement pwm, 6000 is good form me with a 16 bits pwm
 char solax_pwm_active = true;
+String espResp;
+
 
 // Set up relay output
 #define PIN_RL1 21
 #define PIN_RL2 5
 #define PIN_RL3 19
-#define PIN_RL4 23
+#define PIN_RL4 21
 
 // END USER CONFIG
 
@@ -76,21 +67,29 @@ char solax_pwm_active = true;
 // solax/pv2c -> corriente string 2
 // solax/pv1v -> tension string 1
 // solax/pv2v -> tension string 2
+// solax/pw1 -> potencia string 1
+// solax/pw2 -> potencia string 2
 // solax/gridv ->  tension de red
 // solax/wsolar ->  Potencia solar
 // solax/wtoday ->  Potencia solar diaria
 // solax/wgrid ->  Potencia de red (Negativo: de red - Positivo: a red)
-// solax/wtogrid -> Energia enviada a red
+// solax/wtogrid -> Potencia enviada a red
 
 // START CODE
 WiFiMulti wifiMulti;
+HardwareSerial SerieEsp(2); // RX, TX for esp-01
 
-uint8_t error = 0;
+uint8_t nerror = 0; // Nº de error
+boolean werror = false; // Error en conexión Wifi
+boolean serror = false; // Error conexiín Solax
+boolean esp01 = true;
 
 double solax_pv1c ; //corriente string 1
 double solax_pv2c ; //corriente string 2
 int16_t solax_pv1v ; //tension string 1
 int16_t solax_pv2v ; //tension string 2
+int16_t solax_pw1 ; //potencia string 1
+int16_t solax_pw2 ; //potencia string 2
 int16_t solax_gridv ; // tension de red
 double solax_wsolar ; // Potencia solar
 double solax_wtoday ; // Potencia solar diaria
@@ -100,13 +99,35 @@ double solax_wtogrid ; // Potencia enviada a red
 // EEPROM Data
 struct CONFIG {
   byte eeinit;
-  char login1[20];
-  char pass1[20];
-  char login2[20];
-  char pass2[20];
+  boolean autoOta;
+  boolean mqtt;
+  char MQTT_broker[25];
+  char MQTT_user[20];
+  char MQTT_password[20];
+  int  MQTT_port;
+  char login1[25];
+  char pass1[25];
+  char login2[25];
+  char pass2[25];
   byte wversion;
-  char ssid_AP[20];
-  char password_AP[20];
+  char ssid_esp01[25];
+  char password_esp01[20];
+  char solax_ip_v1[18];
+  boolean P01_on; //To implement
+  int pwm_min; 
+  int pwm_max;
+  boolean R01_on; //Relay 1 control output
+  int R01_min;
+  int R01_max;
+  boolean R02_on; //Relay 2 control output
+  int R02_min;
+  int R02_max;
+  boolean R03_on; //Relay 3 control output
+  int R03_min;
+  int R03_max;
+  boolean R04_on; //Relay 4 control output
+  int R04_min;
+  int R04_max;
 };
 
 CONFIG dsConfig;
@@ -121,13 +142,14 @@ PubSubClient client(espClient);
  ***********************************************/
 
 void parseJson(String json) {
+  Serial.println("JSON:" + json);
   DynamicJsonBuffer  jsonBuffer;
   JsonObject& root = jsonBuffer.parseObject(json);
   if (!root.success()) {
     Serial.println("parseObject() failed");
     //publisher("this is not a Json","JsonStatus");
     return;
-  }
+  } else Serial.println("parseObject() OK");
   
     //publisher("Json ok ","JsonStatus");
     solax_pv1c = root["Data"][0]; //corriente string 1
@@ -138,7 +160,9 @@ void parseJson(String json) {
     solax_wsolar = root["Data"][6]; // Potencia solar
     solax_wtoday = root["Data"][8]; // Potencia solar diaria
     solax_wgrid = root["Data"][10]; // Potencia de red (Negativo: de red - Positivo: a red)
-    solax_wtogrid = root["Data"][41]; // Energia enviada a red
+    solax_pw1 = root["Data"][11]; //potencia string 1
+    solax_pw2 = root["Data"][12]; //potencia string 2
+    solax_wtogrid = root["Data"][41]; // Potencia diaria enviada a red
 
     Serial.print("POWER:");
    Serial.println(solax_wgrid);
@@ -217,14 +241,17 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }   
   }
 
+
+
+
 /******** void publisher***********************
     function that publish to the broker
     receives the message and topic
  *                                              *
  ***********************************************/
 void publisher(char* topic, String topublish) {
-  if (client.connect("SodeClient", MQTT_user, MQTT_password)) {
-    Serial.println("connected");
+  if (client.connect("SodeClient", dsConfig.MQTT_user, dsConfig.MQTT_password)) {
+    //Serial.println("connected");
     // Once connected, publish an announcement...
     int length = topublish.length();
     char bufferdata[length];
@@ -242,12 +269,6 @@ void publisher(char* topic, String topublish) {
   }
 }
 
-/*
-   when the mqtt client is disconnected,
-   then try to reconnect to mqtt broker.
-   and suscribe the mqtt suscription topic
-   else try to reconnect each 5+1 seconds
-*/
 
 void reconnect() {
   // Loop until we're reconnected
@@ -255,13 +276,15 @@ void reconnect() {
   if (!client.connected()) {
     Serial.print(F("Attempting MQTT connection..."));
     // Attempt to connect
-    if (client.connect("SodeClient", MQTT_user, MQTT_password)) {
+    if (client.connect("SodeClient", dsConfig.MQTT_user, dsConfig.MQTT_password)) {
       Serial.println("connected");
       
       client.subscribe("solax/pv1c");
       client.subscribe("solax/pv2c");
       client.subscribe("solax/pv1v");
       client.subscribe("solax/pv2v");
+      client.subscribe("solax/pw1");
+      client.subscribe("solax/pw2");
       client.subscribe("solax/gridv");
       client.subscribe("solax/wsolar");
       client.subscribe("solax/wtoday");
@@ -271,14 +294,124 @@ void reconnect() {
       Serial.print(F("failed, rc="));
       //Serial.print(client.stat());
       client.disconnect();
-      client.setServer(MQTT_broker, MQTT_port);
+      client.setServer(dsConfig.MQTT_broker, dsConfig.MQTT_port);
       client.setCallback(callback);
       Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
+      // Wait 1 second before retrying
       delay(1000);
     }
   }
 }
+
+
+//Reset the esp01 module
+void espReset() {
+  while (SerieEsp.available()) SerieEsp.readString();
+  int cont = 0;
+  Serial.println("");
+  Serial.print("Searching ESP-01 ..");
+  esp01 = false;
+  while (cont < 5 && esp01 == false){
+   SerieEsp.println("AT+RST");
+   delay(1000);
+   Serial.print(".");
+   while (SerieEsp.available()) {
+    espResp = SerieEsp.readStringUntil('\n');
+    int pos=espResp.indexOf("OK");
+    if(pos >=0 ) esp01 = true;
+   }
+ cont++; 
+ } // End while  
+
+  if (esp01 == true) {
+    Serial.println("ESP01 Module found & reset.");
+    dsConfig.wversion = 2;
+  } else {
+    Serial.println("ESP01 Module not Found!!!");
+    Serial.println("Autoconfiguring for V1 Wifi version");
+    dsConfig.wversion = 1;
+  }
+
+}
+
+//Connect esp to your wifi network
+void espConnectWifi() {
+  dsConfig.wversion = 2;
+  int count = 10;
+  while(count >= 2 ) {  
+    String cmd = "AT+CWJAP=\"" + String(dsConfig.ssid_esp01) +"\",\"" + String(dsConfig.password_esp01) + "\"";
+    SerieEsp.println(cmd);
+    delay(4000);
+    while (SerieEsp.available()) {
+      espResp = SerieEsp.readStringUntil('\n');
+      int pos=espResp.indexOf("OK");
+      if(pos >=0 ) {
+        Serial.println("Module ESP-01 Connected!");
+        count= 0;
+        break;
+      }
+    }
+    count--;
+  }
+  if (count == 0 ) {
+    Serial.println("Module ESP-01 NOT Connected!"); 
+    esp01 == false;
+    Serial.println("Autoconfiguring for V1 Wifi version");
+    dsConfig.wversion = 1;
+  }
+}
+
+// Send httpost to ESP-01
+int espHttppost () {
+
+  int httpcode = 0;
+  espResp = "";
+  String server = "5.8.8.8";
+  String uri = "/?optType=ReadRealTimeData";
+  String data = "Message";
+    
+  SerieEsp.println("AT+CIPSTART=\"TCP\",\"" + server + "\",80");//start a TCP connection.
+  if( SerieEsp.find("OK")) {
+    USE_SERIAL.println("TCP connection ready");
+  } 
+  delay(1000);
+  
+  String postRequest =
+  "POST " + uri + " HTTP/1.0\r\n" +
+  "Host: " + server + "\r\n" +
+  "Accept: *" + "/" + "*\r\n" +
+  "Content-Length: " + data.length() + "\r\n" +
+  "Content-Type: application/x-www-form-urlencoded\r\n" +
+  "\r\n" + data;
+
+  String sendCmd = "AT+CIPSEND=";//determine the number of caracters to be sent.
+  SerieEsp.print(sendCmd);
+  SerieEsp.println(postRequest.length() );
+  delay(500);
+
+  if(SerieEsp.find(">")) { USE_SERIAL.println("Sending.."); SerieEsp.print(postRequest);
+
+   if( SerieEsp.find("SEND OK")) { 
+    USE_SERIAL.println("Packet sent");
+    httpcode = HTTP_CODE_OK;
+   } else {
+    serror = true;
+    USE_SERIAL.println("Error sending POST to Solax");
+   }
+
+   while (SerieEsp.available()) {
+    espResp = SerieEsp.readString();
+   Serial.println("RECIBIDO: "+espResp);
+   espResp = espResp.substring(espResp.indexOf("{"), espResp.indexOf("}")+1); 
+   }
+  }
+// close the connection
+SerieEsp.println("AT+CIPCLOSE");
+
+return httpcode;
+}
+
+
 void setup() {
 
      // OLED
@@ -317,19 +450,40 @@ void setup() {
       ESP.restart();
     }
     EEPROM.get(0, dsConfig);
-    if (dsConfig.eeinit != 99 ) {
+    if (dsConfig.eeinit != 00 ) {
       USE_SERIAL.println("Configuration Not Found, initializing");
-      dsConfig.eeinit = 99;
-      dsConfig.wversion = 1;
-	  // Cambiar aqui datos mientras no se desarrolla el setup via web
-      strcpy(dsConfig.login1, "SSID-1");
-      strcpy(dsConfig.login2, "SSID-2");
-      strcpy(dsConfig.pass1, "PASS1");
-      strcpy(dsConfig.pass2, "PASS2");
-      strcpy(dsConfig.ssid_AP, "Mi_DS_Plus");
-      strcpy(dsConfig.password_AP, "1234");
+      dsConfig.eeinit = 00;
+      dsConfig.wversion = 2;
+      dsConfig.autoOta = false;
+      dsConfig.mqtt = false;
+      strcpy(dsConfig.MQTT_broker, "192.168.0.2");
+      strcpy(dsConfig.MQTT_user, "MQTT_user");
+      strcpy(dsConfig.MQTT_password, "MQTT_password");
+      dsConfig.MQTT_port = 1883;
+      strcpy(dsConfig.login1, "MIWIFI1");
+      strcpy(dsConfig.login2, "MIWIFI2");
+      strcpy(dsConfig.pass1, "DSPLUSWIFI1");
+      strcpy(dsConfig.pass2, "DSPLUSWIFI2");
+      strcpy(dsConfig.ssid_esp01, "SOLAX");
+      strcpy(dsConfig.password_esp01, "");
+      strcpy(dsConfig.solax_ip_v1, "192.168.0.100");
+      dsConfig.pwm_min = -60;
+      dsConfig.pwm_max = -90;
+      dsConfig.P01_on = false;
+      dsConfig.R01_on = false;
+      dsConfig.R01_min = 9999;
+      dsConfig.R01_max = 9999;
+      dsConfig.R02_on = false;
+      dsConfig.R02_min = 9999;
+      dsConfig.R02_max = 9999;
+      dsConfig.R03_on = false;
+      dsConfig.R03_min = 9999;
+      dsConfig.R03_max = 9999;
+      dsConfig.R04_on = false;
+      dsConfig.R04_min = 9999;
+      dsConfig.R04_max = 9999;
       EEPROM.put(0, dsConfig);
-      EEPROM.commit();      
+      EEPROM.commit();
     }
     
     
@@ -341,29 +495,26 @@ void setup() {
     #endif
 
     // WIFI 
-    Serial.print("Conecting.");
+    Serial.print("Conecting to Wifi.");
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(dsConfig.ssid_AP, dsConfig.password_AP);
-   
-    USE_SERIAL.print("AP IP address: ");
-    USE_SERIAL.println(WiFi.softAPIP());
     
-     
     wifiMulti.addAP(dsConfig.login1, dsConfig.pass1);
     wifiMulti.addAP(dsConfig.login2, dsConfig.pass2);
-    
-    while (wifiMulti.run() != WL_CONNECTED) {
+
+    Serial.print("\r\nWIFI:");
+    int count = 10;
+    while (wifiMulti.run() != WL_CONNECTED && count-- > 0) {
         delay(500);
         Serial.print(".");
     }
-    
+              
     if(wifiMulti.run() == WL_CONNECTED) {
      #if OLED
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.clear();
-      display.drawString(64, 0,"CONECTED:");
+      display.drawString(64, 0,"CONNECTED:");
       display.drawString(64, 14,"IP ADDRESS :");
-      display.drawString(64, 28, String(WiFi.localIP()));
+      display.drawString(64, 28, WiFi.localIP().toString());
      #endif
      Serial.println("");
       USE_SERIAL.println("WiFi connected");
@@ -372,9 +523,73 @@ void setup() {
       #if OLED
         display.display();
       #endif
-      server.begin();
+     
+    } else {
+      werror = true;
+      #if OLED
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      display.clear();
+      display.drawString(64, 0,"NOT CONNECTED:");
+      display.drawString(64, 14,"WIFI ERROR");
+      display.display();
+     #endif
+      USE_SERIAL.println("AP Not valid, SmartConfig actived, please run the app ");
+      delay(5000);
+      #if OLED
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      display.clear();
+      display.drawString(64, 0,"WAITING FOR");
+      display.drawString(64, 14,"SMARTCONFIG");
+      display.display();
+     #endif
+      //WiFi.mode(WIFI_AP_STA);
+      WiFi.beginSmartConfig();
+      Serial.println("Waiting for SmartConfig.");
+      while (!WiFi.smartConfigDone()) {
+          delay(500);
+      Serial.print(".");
+      }
+      delay(2000);
+      USE_SERIAL.println("WiFi connected");
+      USE_SERIAL.println("IP address: ");
+      USE_SERIAL.println(WiFi.localIP());
+
+      #if OLED
+      display.clear();
+      display.drawString(64, 0,"CONNECTED:");
+      display.drawString(64, 14,"IP ADDRESS :");
+      display.drawString(64, 28, WiFi.localIP().toString());
+      display.display();
+      #endif
+      delay(2000);
+   
+      // SAVE WIFI DATA TO EPROM
+      {
+      String buf = WiFi.SSID();
+      char bufferdata[buf.length()];
+      buf.toCharArray(bufferdata,(buf.length() +1));
+      strcpy(dsConfig.login1,bufferdata );
+      }
+      {
+      String buf = WiFi.psk();
+      char bufferdata[buf.length()];
+      buf.toCharArray(bufferdata,(buf.length() +1));
+      strcpy(dsConfig.pass1,bufferdata );
+      }
+      EEPROM.put(0, dsConfig);
+      EEPROM.commit(); 
+      Serial.println ("WIFI DATA SAVED!!!!");
+      werror = false;
     }
     
+    // WIFI ESP-01
+    // initialize serial
+    SerieEsp.begin(115200, SERIAL_8N1, pin_rx, pin_tx);
+    // initialize ESP-01 module
+    delay(1000);
+    espReset();
+    if (esp01 == true) espConnectWifi(); // connect esp01 to inverter
+           
     // PWM
     
     // Initialize channels 
@@ -383,12 +598,12 @@ void setup() {
     ledcAttachPin(pin_pwm, 0); // assign pins to chanel
     ledcWrite(0, solax_pwm);  // Write new pwm value
 
-    if (solax_mqtt_active == true ) {
-      client.setServer(MQTT_broker, MQTT_port);
+    if (dsConfig.mqtt == true ) {
+      client.setServer(dsConfig.MQTT_broker, dsConfig.MQTT_port);
       client.setCallback(callback);
     }
-
-    
+    // http server
+    server.begin();
 }
 
 uint16_t pwm_calc(uint16_t pwm_val) {
@@ -407,68 +622,105 @@ uint16_t pwm_calc(uint16_t pwm_val) {
 }
 
 void loop() {
+
+    int httpcode;
     // wait for WiFi connection
-    if((wifiMulti.run() == WL_CONNECTED)) {
+    if((wifiMulti.run() == WL_CONNECTED) ) { 
         
-        if (solax_mqtt_active == true ) {
+        if (dsConfig.mqtt == true ) {
           if (!client.connected()) {
-            #if OLED 
+            reconnect();
+            if (!client.connected()) {
+              USE_SERIAL.print("Reconnecting MQTT\n");
+              #if OLED 
               display.setTextAlignment(TEXT_ALIGN_CENTER);
               display.drawString(64, 38,"MQTT: Conecting...");
               display.display();
-            #endif
+              #endif
               reconnect();
+              if (!client.connected()) { 
+                dsConfig.mqtt = false;
+                USE_SERIAL.print("\r\nMQTT service not work!!!!\n\r");
+              }
+            }
           }
           else client.loop();
         }
 
         HTTPClient http;
+        if (dsConfig.wversion == 1) {
+          int tmp_error=2;
+          httpcode = -1;
+          while (tmp_error-- >0 && httpcode != HTTP_CODE_OK) {
+            // configure traged server and url
+            char buffer[50];
+            sprintf(buffer, "http://%s/api/realTimeData.htm",dsConfig.solax_ip_v1);
+            USE_SERIAL.println("BUFFER................................." + (String)buffer);
+            http.begin(buffer); //HTTP
+            // start connection and send HTTP header
+            httpcode = http.GET();
 
-        USE_SERIAL.print("[HTTP] begin...\n");
-        // configure traged server and url
-        http.begin(solax_api); //HTTP
+            // httpCode will be negative on error
+          }
 
-        USE_SERIAL.print("[HTTP] GET...\n");
-        // start connection and send HTTP header
-        int httpCode = http.GET();
+        }
 
-        // httpCode will be negative on error
-        if(httpCode > 0) {
+        if (dsConfig.wversion == 2) {
+
+          USE_SERIAL.println();
+          USE_SERIAL.println("Starting connection to ESP-01...");
+          
+          if (esp01 == true) {
+            int tmp_error=5;
+            httpcode = -1;
+            while (tmp_error-- >0 && httpcode != HTTP_CODE_OK) {
+              httpcode = espHttppost();
+            }
+          } else USE_SERIAL.println("Please connect a ESP-01 module !!!");
+
+        }
+        if (httpcode < 0 || httpcode == 404) serror = true; // Error in connection with Solax
+        
+        if(httpcode > 0) {
             // HTTP header has been send and Server response header has been handled
-            USE_SERIAL.printf("[HTTP] GET... code: %d\n", httpCode);
+            USE_SERIAL.printf("[HTTP] code: %d\n", httpcode);
 
             // file found at server
-            if(httpCode == HTTP_CODE_OK) {
-                String payload = http.getString();
-                parseJson(payload);
+            if(httpcode == HTTP_CODE_OK) {
+                serror==false;
+                if (esp01 == false) espResp = http.getString();
+                
+                parseJson(espResp);
                 
                 // Check pwm_output
                 if (solax_pwm_active == true) {  
-                  if ( solax_wgrid > -60 ) { // Value is < 60 w from grid an pwm < 100
+                  if ( solax_wgrid > dsConfig.pwm_min ) { // Default value is < 60 w from grid an pwm < 100
                     USE_SERIAL.println("PWM: SUBIENDO POTENCIA");
-                    if  ( solax_wgrid > 200 && solax_pwm < 165 ) solax_pwm+= 15; // Increment 15 if the grid to power > 200w
+                    if  ( solax_wgrid > (dsConfig.pwm_max+250) && solax_pwm < 165 ) solax_pwm+= 15; // Increment 15 if the grid to power > 250w
                     if (solax_pwm >= 180) solax_pwm = 179; // 180 = 100%
                     solax_pwm += 1 ; //Increment value
                     ledcWrite(0, pwm_calc(solax_pwm));  // Write new pwm value
-                    if (solax_mqtt_active == true ) publisher("/solax/pwm",(String)solax_pwm);
+                    if (dsConfig.mqtt == true ) publisher("/solax/pwm",(String)solax_pwm);
                    }
                   
-                  else if  ( solax_wgrid < -90 )  { // Value is < 90 w from grid an pwm < 125
+                  else if  ( solax_wgrid < dsConfig.pwm_max )  { // Value is < 90 w from grid an pwm < 125
                     USE_SERIAL.println("PWM: BAJANDO POTENCIA");
-                    if  ( solax_wgrid < -350  && solax_pwm > 15) solax_pwm-= 15; // Decrement 15 if the grid from power > 200w
+                    if  ( solax_wgrid < (dsConfig.pwm_max-250)  && solax_pwm > 15) solax_pwm-= 15; // Decrement 15 if the grid from power > 200w
                     if (solax_pwm <= 0) solax_pwm = 1;
                     solax_pwm-= 1 ; //Decrement value 
                     ledcWrite(0, pwm_calc(solax_pwm));  // Write new pwm value
-                    if (solax_mqtt_active == true ) publisher("/solax/pwm", (String)solax_pwm );
+                    if (dsConfig.mqtt == true ) publisher("/solax/pwm", (String)solax_pwm );
                     
                    }
                  }
 
-                publisher("/solax/wgrid",(String)solax_pwm);
+                
                 // Publish mqtt values
-                if (solax_mqtt_active == true ) {
+                if (dsConfig.mqtt == true ) {
                   publisher("/solax/pv1c", (String)solax_pv1c);
                   publisher("/solax/pv2c", (String)solax_pv2c);
+                  publisher("/solax/pw1", (String)solax_pw1);
+                  publisher("/solax/pw2", (String)solax_pw2);
                   publisher("/solax/pw1v", (String)solax_pv1v);
                   publisher("/solax/pw2v", (String)solax_pv2v);
                   publisher("/solax/gridv", (String)solax_gridv);
@@ -476,6 +728,7 @@ void loop() {
                   publisher("/solax/wtoday", (String)solax_wtoday);
                   publisher("/solax/wgrid",  (String)solax_wgrid);
                   publisher("/solax/wtogrid", (String)solax_wtogrid);
+                  publisher("/solax/wgrid",(String)solax_pwm);
                 
                 } 
 
@@ -486,7 +739,7 @@ void loop() {
                   display.setFont(ArialMT_Plain_10);
                   display.drawString(0, 0, "Power Solar . Power Grid");
                   display.setFont(ArialMT_Plain_24);
-                  display.drawString(0, 12, (String)solax_wsolar);
+                  display.drawString(0, 12, (String)(int)solax_wsolar);
                   display.drawString(64, 12, (String)(int)solax_wgrid);
                 #endif
 
@@ -496,11 +749,11 @@ void loop() {
                 int progressbar = ((solax_pwm * 100) / 180);
                                 
                 
-                USE_SERIAL.println("PWM VALUE: % ");
+                USE_SERIAL.print("\r\nPWM VALUE: % ");
                 USE_SERIAL.println(pro);
-                USE_SERIAL.println("PWM VALUE: ");
+                USE_SERIAL.print("\r\nPWM VALUE: ");
                 USE_SERIAL.println(solax_pwm);
-                USE_SERIAL.println("PROGRESS BAR : ");
+                USE_SERIAL.println("\r\nPROGRESS BAR : ");
                 USE_SERIAL.println(progressbar);
                 
                 #if OLED 
@@ -516,7 +769,7 @@ void loop() {
                 
             }
         } else {
-            USE_SERIAL.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+            USE_SERIAL.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpcode).c_str());
             #if OLED
               display.setTextAlignment(TEXT_ALIGN_CENTER);
               display.drawString(64, 52,"Error en red - 01");
@@ -526,17 +779,32 @@ void loop() {
         }
 
         http.end();
- 
+     } // End If Wifi
+
+     if (serror || werror){
+      USE_SERIAL.println("### CONFIGURE SYSTEM PLEASE ###");
+      #if OLED
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      display.clear();
+      display.drawString(64, 0,"CONNECT ERROR");
+      display.drawString(64, 14,"SET UP ON IP");
+      display.drawString(64, 28, WiFi.localIP().toString());
+      display.display();
+      
+      #endif
+     }
+      
     // Http server
-    USE_SERIAL.println("IP address: ");
-    USE_SERIAL.println(WiFi.localIP());
-    
-    for (int16_t s=0;s<=3000;s++) {
+
+    for (int16_t s=0;s<=10000;s++) {
       WiFiClient hclient = server.available();
       if (hclient) {                             // if you get a client,
         USE_SERIAL.println("New Client.");           // print a message out the serial port
         String currentLine = "";                // make a String to hold incoming data from the client
         unsigned int cont = 0;
+        unsigned int page = 0;
+        unsigned int post=0;
+        int post_length = 0;
         while (hclient.connected()) {            // loop while the client's connected
             if (hclient.available()) {             // if there's bytes to read from the client,
               char c = hclient.read();             // read a byte, then
@@ -545,125 +813,329 @@ void loop() {
 
                   // if the current line is blank, you got two newline characters in a row.
                   // that's the end of the client HTTP request, so send a response:
+                  Serial.println ("CURRENTLINE:" + currentLine);
+
+                  if (currentLine.startsWith("Content-Length:")) {
+                    String strtmp = currentLine.substring(currentLine.indexOf('Content-Length:')+1 );
+                    strtmp.trim();
+                    post_length=strtmp.toInt();
+                  }
+                  if (currentLine.startsWith("POST /")) {
+                    post=1;
+                  }
+                  if (currentLine.startsWith("GET /?cnet")) {
+                    page = 1;
+                  }
+                  if (currentLine.startsWith("GET /?config")) {
+                    page = 2;
+                  }
+                  if (currentLine.startsWith("GET /?relay")) {
+                    page = 3;
+                  }
                   if (currentLine.length() == 0) {
-                 
+
+                    //Serial.println("PAGINA PRINCIPAL ---------------------------------------------------------------------------------------------------------------------");
+
+                    if (post!=0) {
+                      currentLine = "";
+                      while(post_length-- > 0)
+                      {
+                        char c = hclient.read();
+                        currentLine += c;
+                      }
+                      post=0;
+                      post_length=0;
+                      
+                      // MQTT CONF
+                      if (currentLine.indexOf("mqttuser=") > 1) {            
+                        {
+                        String buf = currentLine.substring(currentLine.indexOf("tport=")+6,currentLine.indexOf("&Guardar") );
+                        dsConfig.MQTT_port=buf.toInt();
+                        }
+                        {
+                        String buf = currentLine.substring(currentLine.indexOf("roker=")+6,currentLine.indexOf("&mqttuser") );
+                        char bufferdata[buf.length()];
+                        buf.toCharArray(bufferdata,(buf.length() +1));
+                        strcpy(dsConfig.MQTT_broker,bufferdata );
+                        }
+                        {
+                        String buf = currentLine.substring(currentLine.indexOf("tuser=")+6,currentLine.indexOf("&mqttpass") );
+                        char bufferdata[buf.length()];
+                        buf.toCharArray(bufferdata,(buf.length() +1));
+                        strcpy(dsConfig.MQTT_user,bufferdata );
+                        }
+                        {
+                        String buf = currentLine.substring(currentLine.indexOf("tpass=")+6,currentLine.indexOf("&mqttport") );
+                        char bufferdata[buf.length()];
+                        buf.toCharArray(bufferdata,(buf.length() +1));
+                        strcpy(dsConfig.MQTT_password,bufferdata );
+                        }
+                        if (currentLine.substring(currentLine.indexOf("ctive=")+6,currentLine.indexOf("&broker") ) == "Yes") {
+                          dsConfig.mqtt = true;
+                          if (!client.connected()) {
+                            reconnect();
+                          }
+                        }
+                        
+                      }
+
+                      // WIFI CONFIG POST
+                      if (currentLine.indexOf("wifi1=") > 1) {
+                        {
+                        String buf = currentLine.substring(currentLine.indexOf("wifi1=")+6,currentLine.indexOf("&wifip1") );
+                        char bufferdata[buf.length()];
+                        buf.toCharArray(bufferdata,(buf.length() +1));
+                        strcpy(dsConfig.login1,bufferdata );
+                        }
+                        {
+                        String buf = currentLine.substring(currentLine.indexOf("wifi2=")+6,currentLine.indexOf("&wifip2") );
+                        char bufferdata[buf.length()];
+                        buf.toCharArray(bufferdata,(buf.length() +1));
+                        strcpy(dsConfig.login2 ,bufferdata );
+                        }
+                        {
+                        String buf = currentLine.substring(currentLine.indexOf("wifip1=")+7,currentLine.indexOf("&wifi2") );
+                        char bufferdata[buf.length()];
+                        buf.toCharArray(bufferdata,(buf.length() +1));
+                        strcpy(dsConfig.pass1 ,bufferdata );
+                        }
+                        {
+                        String buf = currentLine.substring(currentLine.indexOf("wifip2=")+7,currentLine.indexOf("&wifis") );
+                        char bufferdata[buf.length()];
+                        buf.toCharArray(bufferdata,(buf.length() +1));
+                        strcpy(dsConfig.pass2 ,bufferdata );
+                        }
+                        {
+                        String buf = currentLine.substring(currentLine.indexOf("wifis=")+6,currentLine.indexOf("&Guard") );
+                         if (dsConfig.wversion == 2) {
+                          char bufferdata[buf.length()];
+                          buf.toCharArray(bufferdata,(buf.length() +1));
+                          strcpy(dsConfig.ssid_esp01,bufferdata );
+                         }
+                         if (dsConfig.wversion == 1) { 
+                          char bufferdata[buf.length()];
+                          buf.toCharArray(bufferdata,(buf.length() +1));
+                          strcpy(dsConfig.solax_ip_v1,bufferdata );
+                         }
+                        }
+                        EEPROM.put(0, dsConfig);
+                        EEPROM.commit(); 
+                      Serial.println ("DATA SAVED!!!!");
+                      Serial.println ("RESTARTING IN 5 SEC !!!!");
+                      #if OLED
+                        display.setTextAlignment(TEXT_ALIGN_CENTER);
+                        display.clear();
+                        display.drawString(64, 0,"DATA SAVED");
+                        display.drawString(64, 14,"RESTARTING");
+                        display.drawString(64, 28, "IN 10 SECONDS");
+                        display.display();
+                      #endif
+                      delay(10000);
+                      ESP.restart();
+                      }     
+                      currentLine ="";
+                    } // End POST
+                 // } else if (currentLine.startsWith("GET /?config")) {
+
+                                       
+                    
                     hclient.print("HTTP/1.1 200 OK\r\n"); //send new page
                     hclient.print("Content-Type: text/html\r\n\r\n"); 
                     hclient.print("<!DOCTYPE HTML>\r\n");
                     hclient.print("<HTML>\r\n");//html tag
                     hclient.print("<HEAD>\r\n");
-                    hclient.print("<meta http-equiv='refresh' content='10'/>\r\n");
-                    hclient.print("<meta name='apple-mobile-web-app-capable' content='yes' />\r\n");
-                    hclient.print("<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent' />\r\n");
-                    hclient.print("<link rel='stylesheet' href='https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css'><script src='https://ajax.googleapis.com/ajax/libs/jquery/3.1.1/jquery.min.js'></script><script src='https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/js/bootstrap.min.js'></script>\r\n");
-                    hclient.print("<title>SOLAX openDS+</title>\r\n");
-                    hclient.print("</HEAD>\r\n");
-                    hclient.print("<BODY>\r\n");
-                    hclient.print("<div class='container-fluid'><div class='row'><div class='col-md-12'>");
-                    hclient.print("<h1>OpenDS+ Derivador de excedentes</h1>\r\n");
-                    hclient.print("<h3>para Solax X1 Boost con Wifi Kit</h3>\r\n"); 
-                    hclient.print("<br />\r\n"); 
-                    hclient.print("<ul class='nav nav-pills'>");
-                    hclient.print("<li class='active'> <span class='badge pull-right'>" +String(solax_wsolar) + "w</span> Solar : </li>");
-                    hclient.print("<li> <span class='badge pull-right'>" +String(solax_wgrid)+"w</span> Red : </li>");
-                    hclient.print("<li> <span class='badge pull-right'>" +String(solax_wtoday)+"Kwh</span> Diario : </li>");
-                    hclient.print("</ul>");
-// Tablas
-                    hclient.print("<table class='table'>");  
-                    hclient.print("<thead><tr><th>ID</th><th>Medida</th><th>Valor</th></tr></thead><tbody>");
-                    hclient.print("<tr><td>wsolar</td><td>Potencia Solar</td><td>"+String(solax_wsolar) + "W</td></tr>");
 
-                    hclient.print("<tr><td>pv1c</td><td>Corriente String-1</td><td>"+String(solax_pv1c) + "A</td></tr>");
-                    hclient.print("<tr><td>pv2c</td><td>Corriente String-2</td><td>"+String(solax_pv2c) + "A</td></tr>");
-                    hclient.print("<tr><td>solax_pv1v</td><td>Tensi&oacute;n String-1</td><td>"+String(solax_pv1v) + "V</td></tr>");
-                    hclient.print("<tr><td>pv2v</td><td>Tensi&oacute;n String-2</td><td>"+String(solax_pv2v) + "V</td></tr>");
-                    hclient.print("<tr><td>gridv</td><td>Tensi&oacute;n de red</td><td>"+String(solax_gridv) + "V</td></tr>");
-                    hclient.print("<tr><td>wsolar</td><td>Consumo de red inst&aacute;ntaneo</td><td>"+String(solax_wgrid) + "W</td></tr>");
-                    hclient.print("<tr><td>wtoday</td><td>Energ&iacute;a solar diaria</td><td>"+String(solax_wtoday) + "KWh</td></tr>");
-                    hclient.print("<tr><td>wtogrid</td><td>Energ&iacute;a solar enviada a red</td><td>"+String(solax_wtogrid) + "KWh</td></tr>");
- 
-                    hclient.print("</tbody></table>");
+                    hclient.println("<link rel=\"icon\" href=\"data:,\">");
+                    hclient.println("<style>");
 
+                    hclient.println (".myform { width:450px;padding:30px;margin:40px auto;background: #FFF; border-radius: 10px; -webkit-border-radius:10px; -moz-border-radius: 10px; box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.13); -moz-box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.13); -webkit-box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.13); }");
+                    hclient.println (".myform .inner-wrap{ padding: 30px;background: #F8F8F8; border-radius: 6px; margin-bottom: 15px; }");
+                    hclient.println (".myform h1{background: #2A88AD;padding: 20px 30px 15px 30px;margin: -30px -30px 30px -30px;border-radius: 10px 10px 0 0;-webkit-border-radius: 10px 10px 0 0;-moz-border-radius: 10px 10px 0 0;color: #fff;text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.12);font: normal 30px Arial, Helvetica;-moz-box-shadow: inset 0px 2px 2px 0px rgba(255, 255, 255, 0.17);-webkit-box-shadow: inset 0px 2px 2px 0px rgba(255, 255, 255, 0.17);box-shadow: inset 0px 2px 2px 0px rgba(255, 255, 255, 0.17);border: 1px solid #257C9E; }");
+                    hclient.println (".myform h1 > span{display: block;margin-top: 2px;font: 13px Arial, Helvetica, sans-serif;}");
+                    hclient.println (".myform label{display: block;font: 13px Arial, Helvetica, sans-serif;color: #888;margin-bottom: 15px;}");
+                    hclient.println (".myform input[type='text'], .myform input[type='date'], .myform input[type='datetime'], .myform input[type='email'], .myform input[type='number'], .myform input[type='search'], .myform input[type='time'], .myform input[type='url'], .myform input[type='password'], .myform textarea, .myform select {display: block; box-sizing: border-box; -webkit-box-sizing: border-box; -moz-box-sizing: border-box; width: 100%; padding: 8px; border-radius: 6px; -webkit-border-radius:6px; -moz-border-radius:6px; border: 2px solid #fff; box-shadow: inset 0px 1px 1px rgba(0, 0, 0, 0.33); -moz-box-shadow: inset 0px 1px 1px rgba(0, 0, 0, 0.33); -webkit-box-shadow: inset 0px 1px 1px rgba(0, 0, 0, 0.33); }");
+                    hclient.println (".myform .section{font: normal 20px Arial, Helvetica;color: #2A88AD;margin-bottom: 5px;}");
+                    hclient.println (".myform .section span {background: #2A88AD;padding: 5px 10px 5px 10px;position: absolute;border-radius: 50%;-webkit-border-radius: 50%;-moz-border-radius: 50%;border: 4px solid #fff;font-size: 14px;margin-left: -45px;color: #fff;margin-top: -3px;}");
+                    hclient.println (".myform input[type='button'], .myform input[type='submit']{background: #2A88AD;padding: 8px 20px 8px 20px;border-radius: 5px;-webkit-border-radius: 5px;-moz-border-radius: 5px;color: #fff;text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.12);font: normal 30px Arial, Helvetica;-moz-box-shadow: inset 0px 2px 2px 0px rgba(255, 255, 255, 0.17);-webkit-box-shadow: inset 0px 2px 2px 0px rgba(255, 255, 255, 0.17);box-shadow: inset 0px 2px 2px 0px rgba(255, 255, 255, 0.17);border: 1px solid #257C9E;font-size: 15px;}");
+                    hclient.println (".myform input[type='button']:hover, .myform input[type='submit']:hover{background: #2A6881;-moz-box-shadow: inset 0px 2px 2px 0px rgba(255, 255, 255, 0.28);-webkit-box-shadow: inset 0px 2px 2px 0px rgba(255, 255, 255, 0.28);box-shadow: inset 0px 2px 2px 0px rgba(255, 255, 255, 0.28);}");
+                    hclient.println (".myform .privacy-policy{float: right;width: 250px;font: 12px Arial, Helvetica, sans-serif;color: #4D4D4D;margin-top: 10px;text-align: right;}");
 
-// GPIOS
+                    hclient.println("</style>");
 
-                    hclient.print("<div class='row'>");
-                    hclient.print("<div class='col-md-4'><h4 class ='text-left'>Relay/1 <span class='badge'> Rele 1 </span></h4></div>");
-                    hclient.print("<div class='col-md-4'><form action='/' method='POST'><button type='button submit' name='R1' value='1' class='btn btn-success btn-lg'>ON</button></form></div>");
-                    hclient.print("<div class='col-md-4'><form action='/' method='POST'><button type='button submit' name='R1' value='0' class='btn btn-danger btn-lg'>OFF</button></form></div>");
+                    hclient.println ("<meta name='apple-mobile-web-app-capable' content='yes' />\r\n");
+                    hclient.println ("<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent' />\r\n");
+                   
+                   if(page == 1) { // Wifi Config                   
                     
-                    hclient.print("<div class='col-md-4'><h4 class ='text-left'>Relay/2 <span class='badge'> Rele 2 </span></h4></div>");
-                    hclient.print("<div class='col-md-4'><form action='/' method='POST'><button type='button submit' name='R2' value='1' class='btn btn-success btn-lg'>ON</button></form></div>");
-                    hclient.print("<div class='col-md-4'><form action='/' method='POST'><button type='button submit' name='R2' value='0' class='btn btn-danger btn-lg'>OFF</button></form></div>");
+                    // Search wifi networks
+                    int n = WiFi.scanNetworks();
+                    
+                    hclient.println ("</head>");
+                    hclient.println ("<body>");
+                    hclient.println ("<div class=\"myform\">");
+                    hclient.println ("<h1>openDS+ #Configuraci&oacuten Wifi<span>Derivador de excedentes para Solax X1</span></h1>");
+                    hclient.println ("<form method=\"post\">");
+                    hclient.println ("<div class=\"section\"><span>1</span>Datos conexion wifi</div>");
+                    // 1 - DATOS WIFI
+                    hclient.println ("<div class=\"inner-wrap\">");
+                    hclient.println ("<label>SSID Wifi 1 ("+String(dsConfig.login1)+")");
+                    hclient.println ("<select id='wifi1' name='wifi1'>");
+                    hclient.println (" <option value=\""+String(dsConfig.login1)+"\" selected>Seleccione</option>");
+                    for (int i = 0; i < n; ++i) {
+                    hclient.println (" <option value=\"" +(String)(WiFi.SSID(i))+"\">"+(String)(WiFi.SSID(i))+"</option>");
+                    }
+                    hclient.println ("</select></label>");
+                    hclient.println ("<label>Wifi 1 Password <input type=\"password\" value=\""+String(dsConfig.pass1)+"\" name=\"wifip1\"/></label>");
+                    //2
+                    hclient.println ("<label>SSID Wifi 2 ("+String(dsConfig.login2)+")");
+                    hclient.println ("<select id='wifi2' name='wifi2'>");
+                    hclient.println (" <option value=\""+String(dsConfig.login2)+"\" selected>Seleccione</option>");
+                    for (int i = 0; i < n; ++i) {
+                    hclient.println (" <option value=\"" +(String)(WiFi.SSID(i))+"\">"+(String)(WiFi.SSID(i))+"</option>");
+                    }
+                    hclient.println ("</select></label>");
+                    hclient.println ("<label>Wifi 2 Password <input type=\"password\" value=\""+String(dsConfig.pass2)+"\" name=\"wifip2\"/></label>");
+                    hclient.println ("</div>");
+
+                    // Solax
+                    hclient.println ("<div class=\"section\"><span>2</span>Datos Solax</div>");
+                    hclient.println ("<div class=\"inner-wrap\">");
+                    //Solax V1
+                    if (dsConfig.wversion == 1) {
+                      hclient.println ("<label>IP Wifi V1 solax <input type=\"text\" value=\""+String(dsConfig.solax_ip_v1)+"\" name=\"wifis\"/></label>");
+                    }
+                    //Solax V2
+                    if (dsConfig.wversion == 2) {
+                      hclient.println ("<label>SSID Wifi Solax ("+String(dsConfig.ssid_esp01)+")");
+                      hclient.println ("<select id='wifi1' name='wifis'>");
+                      hclient.println (" <option value=value=\""+String(dsConfig.ssid_esp01)+"\" selected>Seleccione</option>");
+                      for (int i = 0; i < n; ++i) {
+                        hclient.println (" <option value=\"" +(String)(WiFi.SSID(i))+"\">"+(String)(WiFi.SSID(i))+"</option>");
+                      }
+                      hclient.println ("</select></label>");
+                    }
+                    hclient.println ("</div>");
+                    // End
+                        
+                    hclient.println ("<div class=\"button-section\">");
+                    hclient.println ("  <input type=\"submit\" name=\"Guardar\" value=\"Guardar\"/>");
+                    hclient.println ("  <input type=\"button\" name=\"cancel\" value=\"Cancelar\" onClick=\"window.location.href=\'/\'\">");
+                    hclient.println ("</div>");
+                    hclient.println ("</div>");
+                    hclient.println ("</div>");
+                    hclient.println ("</form>");
+                    hclient.println ("</div>");
+                    
+                   } else if (page == 2) { // Config data
+                    
+                    // CONFIG MQTT /////////////////////////////////////////////////
+                    Serial.println("CONFIG DATA...................");
+                    hclient.println ("</head>");
+                    hclient.println ("<body>");
+                    hclient.println ("<div class=\"myform\">");
+                    hclient.println ("<h1>openDS+ #Configuraci&oacuten <span>Derivador de excedentes para Solax X1</span></h1>");
+                    // action=\"/proc\"
+                    hclient.println ("<form method=\"post\">");
+                    hclient.println ("<div class=\"section\"><span>1</span>Datos MQTT</div>");
+                    // 1 - DATOS MQTT
+                    hclient.println ("<div class=\"inner-wrap\">");
+                    {
+                    String tmp = "";
+                    if (dsConfig.mqtt == true) tmp = " checked ";
+                    hclient.println ("<label>MQTT Activo <input type=\"checkbox\" value=\"Yes\" name=\"mqttactive\" "+ tmp +"/></label>");
+                    }
+                    hclient.println ("<label>MQTT Broker <input type=\"textname\" value=\""+String(dsConfig.MQTT_broker)+"\" name=\"broker\"/></label>");
+                    hclient.println ("<label>MQTT Usuario <input type=\"textname\" value=\""+String(dsConfig.MQTT_user)+"\" name=\"mqttuser\"/></label>");
+                    hclient.println ("<label>MQTT Password <input type=\"password\" value=\""+String(dsConfig.MQTT_password)+"\" name=\"mqttpass\"/></label>");
+                    hclient.println ("<label>MQTT Puerto <input type=\"textname\" value=\""+String(dsConfig.MQTT_port)+"\" name=\"mqttport\"/></label>");
+                    hclient.println ("</div>");
+                    // End    
+                    hclient.println ("<div class=\"button-section\">");
+                    hclient.println ("  <input type=\"submit\" name=\"Guardar\" value=\"Guardar\"/>");
+                    hclient.println ("  <input type=\"button\" name=\"cancel\" value=\"Cancelar\" onClick=\"window.location.href=\'/\'\">");
+                    hclient.println ("</div>");
+                    hclient.println ("</div>");
+                    hclient.println ("</div>");
+                    hclient.println ("</form>");
+                    hclient.println ("</div>");
 
                     
-                    hclient.print("<div class='col-md-4'><h4 class ='text-left'>Relay/3 <span class='badge'> Rele 3 </span></h4></div>");
-                    hclient.print("<div class='col-md-4'><form action='/' method='POST'><button type='button submit' name='R3' value='1' class='btn btn-success btn-lg'>ON</button></form></div>");
-                    hclient.print("<div class='col-md-4'><form action='/' method='POST'><button type='button submit' name='R3' value='0' class='btn btn-danger btn-lg'>OFF</button></form></div>");
+                   } else if (page == 3) { // Relay page
+                    Serial.println("RELAY DATA...................");
+    
+                    hclient.println ("</head>");
+                    hclient.println ("<body>");
+                    hclient.println ("<div class=\"myform\">");
+                    hclient.println ("<h1>openDS+ #Configuraci&oacuten Salidas<span>Derivador de excedentes para Solax X1</span></h1>");
+                    // action=\"/proc\"
+                    hclient.println ("<form method=\"post\">");
+                    hclient.println ("<div class=\"section\"><span>1</span>Control de salidas</div>");
+                    // 1 - DATOS MQTT
+                    hclient.println ("<div class=\"inner-wrap\">");
+                    hclient.println ("<label>Coming soon, in the next version <input type=\"textname\" value=\"NADA\" name=\"broker\"/></label>");
+                    hclient.println ("</div>");
+                    // End    
+                    hclient.println ("<div class=\"button-section\">");
+                    hclient.println ("  <input type=\"submit\" name=\"Guardar\" value=\"Guardar\"/>");
+                    hclient.println ("  <input type=\"button\" name=\"cancel\" value=\"Cancelar\" onClick=\"window.location.href=\'/\'\">");
+                    hclient.println ("</div>");
+                    hclient.println ("</div>");
+                    hclient.println ("</div>");
+                    hclient.println ("</form>");
+                    hclient.println ("</div>");
 
+                   } else {
                     
-                    hclient.print("<div class='col-md-4'><h4 class ='text-left'>Relay/4 <span class='badge'> Rele 4 </span></h4></div>");
-                    hclient.print("<div class='col-md-4'><form action='/' method='POST'><button type='button submit' name='R4' value='1' class='btn btn-success btn-lg'>ON</button></form></div>");
-                    hclient.print("<div class='col-md-4'><form action='/' method='POST'><button type='button submit' name='R4' value='0' class='btn btn-danger btn-lg'>OFF</button></form></div>");
+                    ////////////////////////////////Main Page///////////////////////
+                    hclient.println ("<meta http-equiv='refresh' content='30'/>\r\n");
+                    hclient.println ("</head>");
+                    hclient.println ("<body>");
+                    hclient.println ("<form method=\"get\">");
+                    hclient.println ("<div class=\"myform\">");
+                    hclient.println ("<h1>openDS+<span>Derivador de excedentes para Solax X1 V"+String(dsConfig.wversion)+"</span></h1>");
+                   
+                    if (serror || werror) {
+                      hclient.println ("<div class=\"section\"><span>0</span>Errores</div>");
+                      hclient.println ("<div class=\"inner-wrap\">");
+                      if (werror) hclient.println ("<label>No se puede conectar a la Wifi Local</label>");
+                      if (serror) hclient.println ("<label>No se puede conectar al inversor Solax</label>");
+                      hclient.println ("</div>");
+                    }
+                    hclient.println ("<div class=\"section\"><span>1</span>Monitorizaci&oacute;n</div>");
+                    hclient.println ("<div class=\"inner-wrap\">");
+                    hclient.println ("<label>Potencia Solar      : <input type=\"textname=\" value=\"" +String(solax_wsolar) + "\" disabled/> W</label>");
+                    hclient.println ("<label>Potencia de Red     : <input type=\"textname=\" value=\"" +String(solax_wgrid) + "\" disabled/> W</label>");
+                    hclient.println ("<label>Energ&iacute;a Diaria Solar: <input type=\"textname=\" value=\"" +String(solax_wtoday) + "\" disabled/>Wh</label>");
+                    hclient.println ("</div>");
+                    hclient.println ("<div class=\"button-section\">");
+                    hclient.println ("  <input type=\"button\" name=\"cnet\" value=\"Red\" onClick=\"window.location.href=\'/?cnet\'\">");
+                    hclient.println ("  <input type=\"button\" name=\"config\" value=\"Config\" onClick=\"window.location.href=\'/?config\'\">");
+                    hclient.println ("  <input type=\"button\" name=\"relay\" value=\"Salidas\" onClick=\"window.location.href=\'/?relay\'\">");
+                    hclient.println ("</div>");
+                    hclient.println ("</div>");
+                    hclient.println ("</form>");
+                   }
+                    hclient.println ("</body> ");
                     
-                    hclient.print("</div><br><p><a href='http://www.github.com/iqas/derivador'>www.github.com</p></div></div></div>");
+                    hclient.println ("</HTML>");
                     
-                    hclient.print("<br />\r\n");  
-                    hclient.print("<a href=\"/?ver2\"><font color = \"green\">Solax Wifi v1</font></a>\r\n");
-                    hclient.print("<a href=\"/?config\"><font color = \"red\">Config</font></a><br />\r\n");   
-                    hclient.print("<br />\r\n");     
-                    
-                    
-                    hclient.print("<br />\r\n");
-                    hclient.print("</BODY>\r\n");
-                    hclient.print("</HTML>\n");
-
                     // The HTTP response ends with another blank line:
                     hclient.println();
+                    hclient.stop();
+                    page = 0;
+                    break;  
                     
-                    break;
+
                   } else {    // if you got a newline, then clear currentLine:
                     currentLine = "";
                   }
-              } else if (c != '\r') {  // if you got anything else but a carriage return character,
+                } else if (c != '\r') {  // if you got anything else but a carriage return character,
                   currentLine += c;      // add it to the end of the currentLine
-              }
+                }
 
-          // Check to see if the client request was "GET /H" or "GET /L":
-          if (currentLine.endsWith("GET /?config")) {
-            //digitalWrite(5, HIGH);               // GET /H turns the LED on
-            
-                    hclient.print("HTTP/1.1 200 OK\r\n"); //send new page
-                    hclient.print("Content-Type: text/html\r\n\r\n"); 
-                    hclient.print("<!DOCTYPE HTML>\r\n");
-                    hclient.print("<HTML>\r\n");//html tag
-                    hclient.print("<HEAD>\r\n");
-                    hclient.print("<meta name='apple-mobile-web-app-capable' content='yes' />\r\n");
-                    hclient.print("<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent' />\r\n");
-                    hclient.print("<TITLE>SOLAX openDS+</TITLE>\r\n");
-                    hclient.print("</HEAD>\r\n");
-                    hclient.print("<BODY>\r\n");
-                    hclient.print("<H1>OpenDS+ Derivador de excedentes</H1>\r\n");
-                    hclient.print("<H1>para Solax X1 Boost con Wifi Kit</H1>\r\n"); 
-                    hclient.print("<br />\r\n"); 
-                    hclient.print("<H2>Configuración: </H2>\r\n");
-                    hclient.print("<br />\r\n");  
-                    hclient.print("<a href=\"/?\"><font color = \"green\">Inicio</font></a>\r\n");   
-                    hclient.print("<br />\r\n");     
-                    hclient.print("<H2>Config: </H2>\r\n");
-                    hclient.print("<p><<form> Tipo de Wifi Pocket (Versi&oacute;n) <input name=\"pocket\" type=\"text\" value=\"V1\" /> <br /></p>\r\n");
-                    hclient.print("<input name=\"Enviar\" type=\"submit\" value=\"Enviar\"></form><br /></p>\r\n");
-                    hclient.print("<br />\r\n");
-                    hclient.print("</BODY>\r\n");
-                    hclient.print("</HTML>\n");
-
-          }
-          if (currentLine.endsWith("GET /L")) {
-            digitalWrite(5, LOW);                // GET /L turns the LED off
-          }
         }
         cont++; // If the connection crash, break while
-        if (cont == 500) break;
+        if (cont == 900) break;
 
     }
     // close the connection:
@@ -672,6 +1144,4 @@ void loop() {
    }
       delay(1);
   } // End for
-
- } // End If Wifi
 } // End loop
