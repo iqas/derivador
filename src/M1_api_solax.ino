@@ -2,22 +2,28 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
 #include <ESP8266WiFiMulti.h>
 #include <ArduinoJson.h>
 #include <Ticker.h>
+
 Ticker tickerOSWatch;
 
 #define WPASS       ""
 #define WDtimeout 30000
 
+String m1version = "00007$";
+// 7 -> Ota update
+
 ESP8266WiFiMulti WiFiMulti;
 boolean ssid = false;
 String resp = "";
-int bloop = 1000; //ms of loop
+int bloop = 100; //ms of loop
 byte bstatus = 0; //0 Not conected 1- Connected
 int httpcode;
 int cerror = 0; // Error counter
 unsigned long wdt;
+unsigned long count;
 
 
 double solax_pv1c ; //corriente string 1
@@ -33,6 +39,10 @@ double solax_wgrid ; // Potencia de red (Negativo: de red - Positivo: a red)
 double solax_wtogrid ; // Potencia enviada a red
 
 
+/******** void ParseJson***********************
+  this funcition receives json data from
+   http requfest and decode and print it
+ ***********************************************/
 
 void parseJson(String json) {
   DynamicJsonBuffer  jsonBuffer;
@@ -74,13 +84,13 @@ void ICACHE_RAM_ATTR osWatch(void) {
 void setup() {
 
     Serial.begin(115200);
-    Serial.println("##D INIT VERSION M1 00002$");
+    Serial.println("##D INIT VERSION M1 "+m1version);
     
     wdt = millis();
     tickerOSWatch.attach_ms((WDtimeout / 3), osWatch);
     
     WiFi.mode(WIFI_STA);
-    connect_wifi();
+    //connect_wifi();
 
 }
 
@@ -90,19 +100,42 @@ void serial_com() {
      while (Serial.available()) {
       currentLine = Serial.readStringUntil('\n');
       
-      if (currentLine.startsWith("###SSID")){
+      if (currentLine.startsWith("###SSID")){ 
         String buf;
         buf = currentLine.substring(currentLine.indexOf("###SSID=")+8,currentLine.indexOf("$$$") );
         char bufferdata[buf.length()+1];
         buf.toCharArray(bufferdata,(buf.length() +1));
-        WiFiMulti.addAP(bufferdata);
+        WiFiMulti.addAP(bufferdata, "");
         Serial.println("##D M1: Connecting to " + String(bufferdata));
         ssid = true;
+      } else if (currentLine.startsWith("###OTA")){ //OTA UPDATE
+        String buf;
+        buf = currentLine.substring(currentLine.indexOf("###OTA=")+7,currentLine.indexOf("$$1") );
+        char bufferdata[buf.length()+1];
+        buf.toCharArray(bufferdata,(buf.length() +1));
+        buf = currentLine.substring(currentLine.indexOf("$$1")+3,currentLine.indexOf("$$2") );
+        char bufferdata2[buf.length()+1];
+        buf.toCharArray(bufferdata2,(buf.length() +1));
+        WiFiMulti.addAP(bufferdata,bufferdata2);
+        Serial.println("##D M1: Connecting to " + String(bufferdata));
+        uint8_t cont = 20;
+        while(WiFiMulti.run() != WL_CONNECTED && cont-- > 0) {
+          wdt = millis();
+          delay(100); 
+        }
+        if (cont > 1) {
+          Serial.println("##D OTA UPDATE");
+          update_esp();
+        } else Serial.println("##D OTA UPDATE FAIL - NO CONNECT TO WIFI");
+        ESP.reset();
       } else if (currentLine.startsWith("###VERSION")){
-        Serial.println("###VERSION M1 00002$");
+        Serial.println("###VERSION M1 "+m1version);
       } else if (currentLine.startsWith("###RESET")){
         Serial.println("##D RESETING M1");
         ESP.reset();
+      } else if (currentLine.startsWith("###UPDATE")){
+        Serial.println("##D UPDATING M1");
+        update_esp();
       } else if (currentLine.startsWith("###PAYLOAD")){
         resp = "###PAYLOAD:{\"Data\":[" + String(solax_pv1c) + "," + String(solax_pv2c) + "," + String(solax_pv1v) + "," + String(solax_pv2v) + "," + String(solax_pw1) + "," + String(solax_pw2) + "," + String(solax_gridv) + "," + String(solax_wsolar) + "," + String(solax_wtoday) + "," + String(solax_wgrid) + "," + String(solax_wtogrid) + "]}$$$";
         Serial.println(resp);
@@ -118,24 +151,28 @@ void serial_com() {
    }
 }
 
-void connect_wifi() {
-  Serial.println("###STATUS:"+String(bstatus)+"$$$");
-  uint8_t cont = 100;
-  while(WiFiMulti.run() != WL_CONNECTED && cont-- > 0) {
-  //if (WiFiMulti.run() != WL_CONNECTED) {
-     serial_com();
-     if (ssid) {
-        if (WiFiMulti.run()  == WL_CONNECTED) {
-            Serial.println("##DIP : " + WiFi.localIP());
-            Serial.println("##DDONE CONNECT");
-            bstatus=1;
-        }
-        Serial.print(" .");
-     }
-     //Serial.print(" |");
- delay(50);
- }
 
+void update_esp() {
+  // wait for WiFi connection
+  if ((WiFiMulti.run() == WL_CONNECTED)) {
+    wdt = millis();
+    t_httpUpdate_return ret = ESPhttpUpdate.update("http://bico.org.es/m1.bin");
+    wdt = millis();
+    switch (ret) {
+      case HTTP_UPDATE_FAILED:
+        Serial.printf("##D HTTP_UPDATE_FAILD Error (%d): %s", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+        break;
+
+      case HTTP_UPDATE_NO_UPDATES:
+        Serial.println("##D HTTP_UPDATE_NO_UPDATES");
+        break;
+
+      case HTTP_UPDATE_OK:
+        Serial.println("##D HTTP_UPDATE_OK");
+        break;
+    }
+    ESP.reset();
+  }
 }
 
 void loop() {
@@ -143,11 +180,15 @@ void loop() {
     wdt = millis();
     serial_com();
     if (WiFiMulti.run() == WL_CONNECTED) {
+	   if (bstatus == 0)  Serial.println("##D CONNECTED TO SOLAX");
 	   bstatus = 1;
-	   if (bloop <= 0) {
+     delay(50);
+     //TODO - Count configurable
+	    if (millis() - count> 1500) {
+        count = millis();
         HTTPClient http;
 
-        http.begin("http://5.8.8.8/?optType=ReadRealTimeData"); 
+        http.begin("http://5.8.8.8/?optType=ReadRealTimeData");  
         http.addHeader("Host", "5.8.8.8");
         http.addHeader("Content-Length", "0");
         http.addHeader("Accept", "/*/");
@@ -160,27 +201,31 @@ void loop() {
             if(httpcode == HTTP_CODE_OK) {
                 resp = http.getString();
                 parseJson(resp);
-                delay(0);
+                yield();
             }
         } else {
+            Serial.println("##D [HTTP] GET... failed, error");
             cerror++;
         }
 
         http.end();
-		  bloop = 1000;
-	  }
+	    }
 
     } else {
 
-      Serial.println("##D M1: NOT CONNECT");
+      if (bloop <= 0) {
+        Serial.println("##D M1: NOT CONNECT");
+        bloop = 100;
+        Serial.println("CERROR: ..........................................................." + String(cerror));
+      }
       bstatus = 0;
-	    bloop=1500;
+	    
       cerror++;
-      connect_wifi();
 
     }
-    if (cerror >= 30) ESP.reset();
-    delay(1);
+    if (cerror >= 50000) ESP.reset();
+    delay(50);
 	  bloop--;
 
 }
+
